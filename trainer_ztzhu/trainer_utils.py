@@ -27,6 +27,10 @@ def get_lr(current_step, total_steps, lr):
     return lr / 10 + 0.5 * lr * (1 + math.cos(math.pi * current_step / total_steps))
 
 
+def get_num_params(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
 def init_distributed_mode():
     if int(os.environ.get("RANK", -1)) == -1:
         return 0  # 非DDP模式
@@ -133,9 +137,7 @@ def init_model(
         weights = torch.load(weight_path, map_location=device)
         model.load_state_dict(weights, strict=False)
 
-    Logger(
-        f"所加载Model可训练参数：{sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.3f} 百万"
-    )
+    Logger(f"所加载Model可训练参数：{get_num_params(model) / 1e6:.3f} M")
     return model.to(device), tokenizer
 
 
