@@ -4,3 +4,5 @@ docs-minimind/
 *.jsonl
 checkpoints
 __pycache__
+swanlog
+wandb
