@@ -49,7 +49,7 @@ class TrainArgs:
     betas: tuple = (0.9, 0.999)
     device: str = None
     dtype: str = "bfloat16"
-    num_workers: int = 1  # 数据加载线程数
+    num_workers: int = 0  # 数据加载线程数
     accumulation_steps: int = 8  # 梯度累积步数
     grad_clip: float = 1.0  # 梯度裁剪阈值
     log_interval: int = 100  # 日志打印间隔
@@ -65,6 +65,7 @@ class TrainArgs:
     use_wandb: bool = False
     wandb_entity: str = None
     wandb_project: str = "MiniMind"
+    profile: bool = False
 
     def __post_init__(self):
         assert self.dtype in ["bfloat16", "float16"]
@@ -76,6 +77,135 @@ class TrainArgs:
         self.data_path = Path(self.data_path)
         self.dataset_name = self.data_path.name
         self.data_path = self.data_path.as_posix()
+        if self.profile:
+            self.use_wandb = False
+
+
+def compute_per_token_entropy(logits: torch.Tensor) -> torch.Tensor:
+    """
+    logits: (batch_size, sequence_length, vocab_size)
+    per_token_entropy: (batch_size, sequence_length)
+    """
+    log_p = torch.nn.functional.log_softmax(logits, dim=-1)
+    p = torch.exp(log_p)
+    per_token_entropy = -(p * log_p).sum(-1)
+    return per_token_entropy
+
+
+def train_epoch(
+    model: MiniMindForCausalLM,
+    args: TrainArgs,
+    lm_config: MiniMindConfig,
+    optimizer: optim.Optimizer,
+    scheduler: optim.lr_scheduler.LRScheduler,
+    scaler: torch.GradScaler,
+    epoch: int,
+    loader: DataLoader,
+    iters: int,
+    bar,
+    start_step=0,
+    use_wandb=False,
+    spend_time=0,
+):
+    loss_fct = nn.CrossEntropyLoss(reduction="none")
+    dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
+    start_time = time.time()
+    grad_norm = float("nan")
+
+    def get_spend_time():
+        return spend_time + time.time() - start_time
+
+    for step, (X, Y, loss_mask) in enumerate(loader, start=start_step + 1):
+        X = X.to(args.device)  # (batch_size, seq_len-1)
+        Y = Y.to(args.device)  # (batch_size, seq_len-1)
+        loss_mask = loss_mask.to(args.device)
+        if args.profile:
+            print("data to deivce:", get_spend_time())
+
+        with torch.autocast(device_type=args.device, enabled=args.use_amp, dtype=dtype):
+            res = model(X)
+            if args.profile:
+                torch.cuda.synchronize()
+                print("forward:", get_spend_time())
+            logits = res.logits  # (batch_size, seq_len-1, vocab_size)
+            loss = loss_fct(logits.view(-1, logits.size(-1)), Y.view(-1)).view(Y.size())
+
+            loss = (loss * loss_mask).sum() / loss_mask.sum()
+            loss += res.aux_loss
+            loss = loss / args.accumulation_steps
+
+        scaler.scale(loss).backward()
+        if args.profile:
+            print("backward:", get_spend_time())
+        loss = loss.detach().cpu().numpy().item() * args.accumulation_steps
+        lr = optimizer.param_groups[-1]["lr"]
+
+        if step % args.accumulation_steps == 0:
+            with torch.inference_mode():
+                per_token_entropy = compute_per_token_entropy(logits)
+                token_entropy = (per_token_entropy * loss_mask).sum() / loss_mask.sum()
+
+            scaler.unscale_(optimizer)
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                model.parameters(), args.grad_clip
+            )
+            grad_norm = grad_norm.detach().cpu().numpy().item()
+
+            scaler.step(optimizer)
+            scaler.update()
+
+            optimizer.zero_grad()
+            torch.cuda.empty_cache()
+
+            if use_wandb:
+                wandb.log(
+                    {
+                        "train_step": step,
+                        "train/epoch": epoch + 1,
+                        "train/loss": loss,
+                        "train/lr": lr,
+                        "train/token_entropy": token_entropy,
+                        "train/grad_norm": grad_norm,
+                        "train/time": get_spend_time(),
+                    }
+                )
+        scheduler.step()
+        if bar is not None:
+            bar.update()
+            bar.set_postfix_str(
+                f"[{epoch+1}/{args.epochs}]loss={round(loss, 4)},lr:{lr:.10f},grad_norm={round(grad_norm, 4)}"
+            )
+
+        if step % args.log_interval == 0 or step == iters - 1:
+            Logger(f"Epoch:[{epoch+1}/{args.epochs},{step}/{iters}] loss:{loss:.4f}")
+
+        if args.profile and step == 2:
+            return
+        if (step % args.save_interval == 0 or step == iters - 1) and is_main_process():
+            model.eval()
+            moe_suffix = "_moe" if lm_config.use_moe else ""
+            ckp = f"{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth"
+            if isinstance(model, torch.nn.parallel.DistributedDataParallel):
+                state_dict = model.module.state_dict()
+            else:
+                state_dict = model.state_dict()
+            state_dict = {k: v.half() for k, v in state_dict.items()}  # 半精度保存
+            torch.save(state_dict, ckp)
+            lm_checkpoint(
+                lm_config,
+                weight=args.save_weight,
+                model=model,
+                optimizer=optimizer,
+                scaler=scaler,
+                scheduler=scheduler,
+                epoch=epoch,
+                step=step,
+                wandb_id=wandb.run.id,
+                save_dir=args.save_dir,
+                spend_time=get_spend_time(),
+            )
+            model.train()
+    return get_spend_time()
 
 
 def train(
@@ -236,123 +366,47 @@ def train(
                 use_wandb=use_wandb,
                 spend_time=spend_time,
             )
+            if args.profile:
+                return
     bar.close()
 
 
-def train_epoch(
-    model: MiniMindForCausalLM,
-    args: TrainArgs,
-    lm_config: MiniMindConfig,
-    optimizer: optim.Optimizer,
-    scheduler: optim.lr_scheduler.LRScheduler,
-    scaler: torch.GradScaler,
-    epoch: int,
-    loader: DataLoader,
-    iters: int,
-    bar,
-    start_step=0,
-    use_wandb=False,
-    spend_time=0,
-):
-    loss_fct = nn.CrossEntropyLoss(reduction="none")
-    dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
-    start_time = time.time()
-
-    def get_spend_time():
-        return spend_time + time.time() - start_time
-
-    for step, (X, Y, loss_mask) in enumerate(loader, start=start_step + 1):
-        X = X.to(args.device)  # (batch_size, seq_len-1)
-        Y = Y.to(args.device)  # (batch_size, seq_len-1)
-        loss_mask = loss_mask.to(args.device)
-
-        with torch.autocast(device_type=args.device, enabled=args.use_amp, dtype=dtype):
-            res = model(X)
-            logits = res.logits  # (batch_size, seq_len-1, vocab_size)
-            loss = loss_fct(logits.view(-1, logits.size(-1)), Y.view(-1)).view(Y.size())
-
-            loss = (loss * loss_mask).sum() / loss_mask.sum()
-            loss += res.aux_loss
-            loss = loss / args.accumulation_steps
-
-        scaler.scale(loss).backward()
-        loss = loss.detach().cpu().numpy().item() * args.accumulation_steps
-        lr = optimizer.param_groups[-1]["lr"]
-
-        if step % args.accumulation_steps == 0:
-            with torch.inference_mode():
-                per_token_entropy = compute_per_token_entropy(logits)
-                token_entropy = (per_token_entropy * loss_mask).sum() / loss_mask.sum()
-
-            scaler.unscale_(optimizer)
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                model.parameters(), args.grad_clip
-            )
-            grad_norm = grad_norm.detach().cpu().numpy().item()
-
-            scaler.step(optimizer)
-            scaler.update()
-
-            optimizer.zero_grad()
-            scheduler.step()
-            torch.cuda.empty_cache()
-
-            bar.update()
-            bar.set_postfix_str(
-                f"[{epoch+1}/{args.epochs}]({step}/{iters})loss={round(loss, 4)},grad_norm={round(grad_norm, 4)}"
-            )
-
-            if use_wandb:
-                wandb.log(
-                    {
-                        "train_step": step,
-                        "train/epoch": epoch + 1,
-                        "train/loss": loss,
-                        "train/lr": lr,
-                        "train/token_entropy": token_entropy,
-                        "train/grad_norm": grad_norm,
-                        "train/time": get_spend_time(),
-                    }
-                )
-
-        if step % args.log_interval == 0 or step == iters - 1:
-            Logger(
-                f"Epoch:[{epoch+1}/{args.epochs}]({step}/{iters}) loss:{loss:.4f} lr:{lr:.7f}"
-            )
-
-        if (step % args.save_interval == 0 or step == iters - 1) and is_main_process():
-            model.eval()
-            moe_suffix = "_moe" if lm_config.use_moe else ""
-            ckp = f"{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth"
-            if isinstance(model, torch.nn.parallel.DistributedDataParallel):
-                state_dict = model.module.state_dict()
-            else:
-                state_dict = model.state_dict()
-            state_dict = {k: v.half() for k, v in state_dict.items()}  # 半精度保存
-            torch.save(state_dict, ckp)
-            lm_checkpoint(
-                lm_config,
-                weight=args.save_weight,
-                model=model,
-                optimizer=optimizer,
-                scaler=scaler,
-                scheduler=scheduler,
-                epoch=epoch,
-                step=step,
-                wandb_id=wandb.run.id,
-                save_dir=args.save_dir,
-                spend_time=get_spend_time(),
-            )
-            model.train()
-    return get_spend_time()
-
-
-def compute_per_token_entropy(logits: torch.Tensor) -> torch.Tensor:
+def evaluate_pretrained(model, tokenizer, prompt: str) -> None:
     """
-    logits: (batch_size, sequence_length, vocab_size)
-    per_token_entropy: (batch_size, sequence_length)
+    Evaluate a language model on a list of prompts,
+    compute evaluation metrics, and serialize results to disk.
+
+    generation_config = GenerationConfig(
+        temperature=1.0,
+        top_p=1.0,
+        min_new_tokens=4,
+        max_new_tokens=1024,
+        stop_strings=["</answer>"],
+        do_sample=True,
+    )
     """
-    log_p = torch.nn.functional.log_softmax(logits, dim=-1)
-    p = torch.exp(log_p)
-    per_token_entropy = -(p * log_p).sum(-1)
-    return per_token_entropy
+    from transformers import GenerationConfig
+
+    generation_config = GenerationConfig(
+        temperature=1.0,
+        top_p=1.0,
+        min_new_tokens=4,
+        max_new_tokens=1024,
+        stop_strings=[tokenizer.eos_token],
+        do_sample=True,
+    )
+    prompts = [tokenizer.bos_token + prompt]
+    device = model.device
+    inputs = tokenizer(
+        prompts,
+        padding=True,
+        return_tensors="pt",
+        padding_side="left",
+        return_token_type_ids=False,
+    ).to(device)
+    response = model.generate(
+        **inputs, generation_config=generation_config, tokenizer=tokenizer
+    )
+    response = response[:, inputs["input_ids"].shape[1] :]
+    response = tokenizer.batch_decode(response, skip_special_tokens=True)[0]
+    return response
