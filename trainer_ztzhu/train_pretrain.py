@@ -6,6 +6,7 @@ project_path = project_dir.as_posix()
 if project_path not in sys.path:
     sys.path.insert(0, project_path)
 
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 import os
 import time
@@ -16,6 +17,8 @@ from torch import nn, optim
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
+from tqdm import tqdm
+import wandb
 
 from dataset.lm_dataset import PretrainDataset
 from model.model_minimind import MiniMindConfig
@@ -60,18 +63,28 @@ class TrainArgs:
     from_weight: str = "none"  # 基于哪个权重训练，为none则从头开始
     from_resume: int = 0  # 是否自动检测&续训（0=否，1=是）
     use_wandb: bool = False
+    wandb_entity: str = None
     wandb_project: str = "MiniMind"
 
     def __post_init__(self):
+        assert self.dtype in ["bfloat16", "float16"]
         if self.device is None:
             self.device = "cuda:0" if torch.cuda.is_available() else "cpu"
         if self.use_amp is None:
             self.use_amp = "cuda" in self.device
         self.save_dir = Path(self.save_dir).as_posix()
-        self.data_path = Path(self.data_path).as_posix()
+        self.data_path = Path(self.data_path)
+        self.dataset_name = self.data_path.name
+        self.data_path = self.data_path.as_posix()
 
 
-def train(args: TrainArgs):
+def train(
+    args: TrainArgs,
+    model: MiniMindForCausalLM = None,
+    tokenizer=None,
+    train_ds: PretrainDataset = None,
+    early_return=False,
+):
     # ========== 1. 初始化环境和随机种子 ==========
     local_rank = init_distributed_mode()
     if dist.is_initialized():
@@ -95,15 +108,21 @@ def train(args: TrainArgs):
     # set in TrainArgs
 
     # ========== 4. 定义模型、数据、优化器 ==========
-    model, tokenizer = init_model(
-        lm_config,
-        args.from_weight,
-        tokenizer_path=project_dir / "model",
-        save_dir=args.save_dir,
-        device=args.device,
-    )
+    if model is None:
+        model, tokenizer = init_model(
+            lm_config,
+            args.from_weight,
+            tokenizer_path=project_dir / "model",
+            save_dir=args.save_dir,
+            device=args.device,
+        )
     num_params = get_num_params(model)
-    train_ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
+    if train_ds is None:
+        train_ds = PretrainDataset(
+            args.data_path, tokenizer, max_length=args.max_seq_len
+        )
+    if early_return:
+        return model, tokenizer, train_ds
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
     scaler = torch.GradScaler(args.device, enabled=(args.dtype == "float16"))
     optimizer = optim.AdamW(
@@ -112,26 +131,71 @@ def train(args: TrainArgs):
         weight_decay=args.weight_decay,
         betas=args.betas,
     )
+
+    # ========== 5. 从ckp恢复状态 ==========
+    start_epoch, start_step = 0, 0
+    spend_time = 0
+    if ckp_data:
+        model.load_state_dict(ckp_data["model"])
+        optimizer.load_state_dict(ckp_data["optimizer"])
+        scaler.load_state_dict(ckp_data["scaler"])
+        start_epoch = ckp_data["epoch"]
+        start_step = ckp_data.get("step", 0)
+        spend_time = ckp_data.get("spend_time", 0)
+    if start_step > 0:  # 第一个epoch且存在检查点
+        batch_sampler = SkipBatchSampler(
+            train_sampler or range(len(train_ds)), args.batch_size, start_step + 1
+        )
+        loader = DataLoader(
+            train_ds,
+            batch_sampler=batch_sampler,
+            num_workers=args.num_workers,
+            pin_memory=True,
+        )
+    else:  # 默认从头开始
+        loader = DataLoader(
+            train_ds,
+            batch_size=args.batch_size,
+            shuffle=(train_sampler is None),
+            sampler=train_sampler,
+            num_workers=args.num_workers,
+            pin_memory=True,
+        )
     iters = len(loader)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.epochs * iters
-    )
+    max_step = args.epochs * iters
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_step)
+    if start_step > 0:
+        scheduler.load_state_dict(ckp_data["scheduler"])
 
-    # ========== 5. 配wandb ==========
-    wandb = None
-    if args.use_wandb and is_main_process():
-        import swanlab as wandb
+    # ========== 6. DDP包模型 ==========
+    if dist.is_initialized():
+        model._ddp_params_and_buffers_to_ignore = {"freqs_cos", "freqs_sin"}
+        model = DistributedDataParallel(model, device_ids=[local_rank])
 
+    # ========== 7. 配wandb ==========
+    run = nullcontext()
+    use_wandb = args.use_wandb and is_main_process()
+    if use_wandb:
         wandb_id = ckp_data.get("wandb_id") if ckp_data else None
         resume = "must" if wandb_id else None
-        wandb_run_name = f"MiniMind-{round(num_params)}M-{args.save_weight}-epoch-{args.epochs}-batchsize-{args.batch_size}-lr-{args.learning_rate}"
+        wandb_run_name = f"MiniMind-{round(num_params/1e6)}M-{args.save_weight}-epoch-{args.epochs}-batchsize-{args.batch_size}-lr-{args.learning_rate}"
         if wandb_id:
             config = None
         else:
             config = asdict(args)
-            for key in ["device", "from_resume", "use_wandb", "wandb_project"]:
+            for key in [
+                "device",
+                "from_resume",
+                "use_wandb",
+                "wandb_project",
+                "save_dir",
+                "data_path",
+            ]:
                 config.pop(key)
-        wandb.init(
+            config["max_step"] = max_step
+            config["num_params"] = num_params
+        run = wandb.init(
+            entity=args.wandb_entity,
             project=args.wandb_project,
             name=wandb_run_name,
             id=wandb_id,
@@ -143,39 +207,21 @@ def train(args: TrainArgs):
         wandb.define_metric("train/*", step_metric="train_step")
         wandb.define_metric("eval/*", step_metric="eval_step")
 
-    # ========== 6. 从ckp恢复状态 ==========
-    start_epoch, start_step = 0, 0
-    if ckp_data:
-        model.load_state_dict(ckp_data["model"])
-        optimizer.load_state_dict(ckp_data["optimizer"])
-        scaler.load_state_dict(ckp_data["scaler"])
-        scheduler.load_state_dict(ckp_data["scheduler"])
-        start_epoch = ckp_data["epoch"]
-        start_step = ckp_data.get("step", 0)
-
-    # ========== 7. DDP包模型 ==========
-    if dist.is_initialized():
-        model._ddp_params_and_buffers_to_ignore = {"freqs_cos", "freqs_sin"}
-        model = DistributedDataParallel(model, device_ids=[local_rank])
-
     # ========== 8. 开始训练 ==========
-    for epoch in range(start_epoch, args.epochs):
-        train_sampler and train_sampler.set_epoch(epoch)
-        if epoch == start_epoch and start_step > 0:  # 第一个epoch且存在检查点
-            batch_sampler = SkipBatchSampler(
-                train_sampler or range(len(train_ds)), args.batch_size, start_step + 1
-            )
-            loader = DataLoader(
-                train_ds,
-                batch_sampler=batch_sampler,
-                num_workers=args.num_workers,
-                pin_memory=True,
-            )
-            Logger(
-                f"Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始"
-            )
-            # train_epoch(epoch, loader, len(loader) + start_step + 1, start_step, wandb)
-            train_epoch(
+    bar = tqdm(total=max_step, disable=not is_main_process())
+    with run:
+        for epoch in range(start_epoch, args.epochs):
+            train_sampler and train_sampler.set_epoch(epoch)
+            if epoch == start_epoch and start_step > 0:  # 第一个epoch且存在检查点
+                Logger(
+                    f"Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始"
+                )
+                # train_epoch(epoch, loader, len(loader) + start_step + 1, start_step, wandb)
+                _iters = iters + start_step + 1
+                bar.update(start_step)
+            else:  # 默认从头开始
+                _iters = iters
+            spend_time = train_epoch(
                 model=model,
                 args=args,
                 lm_config=lm_config,
@@ -184,32 +230,13 @@ def train(args: TrainArgs):
                 scaler=scaler,
                 epoch=epoch,
                 loader=loader,
-                iters=iters + start_step + 1,
+                iters=_iters,
                 start_step=start_step,
-                wandb=wandb,
+                bar=bar,
+                use_wandb=use_wandb,
+                spend_time=spend_time,
             )
-        else:  # 默认从头开始
-            loader = DataLoader(
-                train_ds,
-                batch_size=args.batch_size,
-                shuffle=(train_sampler is None),
-                sampler=train_sampler,
-                num_workers=args.num_workers,
-                pin_memory=True,
-            )
-            train_epoch(
-                model=model,
-                args=args,
-                lm_config=lm_config,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                scaler=scaler,
-                epoch=epoch,
-                loader=loader,
-                iters=iters,
-                start_step=0,
-                wandb=wandb,
-            )
+    bar.close()
 
 
 def train_epoch(
@@ -222,30 +249,41 @@ def train_epoch(
     epoch: int,
     loader: DataLoader,
     iters: int,
+    bar,
     start_step=0,
-    wandb=None,
+    use_wandb=False,
+    spend_time=0,
 ):
     loss_fct = nn.CrossEntropyLoss(reduction="none")
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
     start_time = time.time()
+
+    def get_spend_time():
+        return spend_time + time.time() - start_time
+
     for step, (X, Y, loss_mask) in enumerate(loader, start=start_step + 1):
-        X = X.to(args.device)
-        Y = Y.to(args.device)
+        X = X.to(args.device)  # (batch_size, seq_len-1)
+        Y = Y.to(args.device)  # (batch_size, seq_len-1)
         loss_mask = loss_mask.to(args.device)
 
         with torch.autocast(device_type=args.device, enabled=args.use_amp, dtype=dtype):
             res = model(X)
-            loss = loss_fct(res.logits.view(-1, res.logits.size(-1)), Y.view(-1)).view(
-                Y.size()
-            )
+            logits = res.logits  # (batch_size, seq_len-1, vocab_size)
+            loss = loss_fct(logits.view(-1, logits.size(-1)), Y.view(-1)).view(Y.size())
 
             loss = (loss * loss_mask).sum() / loss_mask.sum()
             loss += res.aux_loss
             loss = loss / args.accumulation_steps
 
         scaler.scale(loss).backward()
+        loss = loss.detach().cpu().numpy().item() * args.accumulation_steps
+        lr = optimizer.param_groups[-1]["lr"]
 
-        if (step + 1) % args.accumulation_steps == 0:
+        if step % args.accumulation_steps == 0:
+            with torch.inference_mode():
+                per_token_entropy = compute_per_token_entropy(logits)
+                token_entropy = (per_token_entropy * loss_mask).sum() / loss_mask.sum()
+
             scaler.unscale_(optimizer)
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 model.parameters(), args.grad_clip
@@ -259,20 +297,28 @@ def train_epoch(
             scheduler.step()
             torch.cuda.empty_cache()
 
-        if step % args.log_interval == 0 or step == iters - 1:
-            spend_time = time.time() - start_time
-            current_loss = loss.item() * args.accumulation_steps
-            current_lr = optimizer.param_groups[-1]["lr"]
-            eta_min = spend_time / (step + 1) * iters // 60 - spend_time // 60
-
-            Logger(
-                f"Epoch:[{epoch+1}/{args.epochs}]({step}/{iters}) loss:{current_loss:.6f} lr:{current_lr:.12f} epoch_Time:{eta_min}min:"
+            bar.update()
+            bar.set_postfix_str(
+                f"[{epoch+1}/{args.epochs}]({step}/{iters})loss={round(loss, 4)},grad_norm={round(grad_norm, 4)}"
             )
 
-            if wandb:
+            if use_wandb:
                 wandb.log(
-                    {"loss": current_loss, "lr": current_lr, "epoch_Time": eta_min}
+                    {
+                        "train_step": step,
+                        "train/epoch": epoch + 1,
+                        "train/loss": loss,
+                        "train/lr": lr,
+                        "train/token_entropy": token_entropy,
+                        "train/grad_norm": grad_norm,
+                        "train/time": get_spend_time(),
+                    }
                 )
+
+        if step % args.log_interval == 0 or step == iters - 1:
+            Logger(
+                f"Epoch:[{epoch+1}/{args.epochs}]({step}/{iters}) loss:{loss:.4f} lr:{lr:.7f}"
+            )
 
         if (step % args.save_interval == 0 or step == iters - 1) and is_main_process():
             model.eval()
@@ -290,9 +336,23 @@ def train_epoch(
                 model=model,
                 optimizer=optimizer,
                 scaler=scaler,
+                scheduler=scheduler,
                 epoch=epoch,
                 step=step,
-                wandb=wandb,
+                wandb_id=wandb.run.id,
                 save_dir=args.save_dir,
+                spend_time=get_spend_time(),
             )
             model.train()
+    return get_spend_time()
+
+
+def compute_per_token_entropy(logits: torch.Tensor) -> torch.Tensor:
+    """
+    logits: (batch_size, sequence_length, vocab_size)
+    per_token_entropy: (batch_size, sequence_length)
+    """
+    log_p = torch.nn.functional.log_softmax(logits, dim=-1)
+    p = torch.exp(log_p)
+    per_token_entropy = -(p * log_p).sum(-1)
+    return per_token_entropy
