@@ -6,3 +6,4 @@ checkpoints
 __pycache__
 swanlog
 wandb
+*.pth
