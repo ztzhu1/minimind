@@ -9,8 +9,6 @@ Resources:
 - [cs-self-learning](https://csdiy.wiki/en/)
 - [DPR](https://github.com/facebookresearch/DPR/tree/main)
 - [Karpukhin et al., 2020](https://arxiv.org/pdf/2004.04906)
-
-
 """
 
 from pathlib import Path
@@ -21,14 +19,18 @@ project_path = project_dir.as_posix()
 if project_path not in sys.path:
     sys.path.insert(0, project_path)
 
+from collections import Counter
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 import json
+from multiprocessing import Pool
 import os
+import re
 import time
-from typing import Union
+from typing import List, Union
 import warnings
 
+import datasets
 import numpy as np
 import pandas as pd
 import torch
@@ -80,61 +82,40 @@ def load_jsonl(path):
     return data
 
 
-def make_huatuo_512(dataset, key="test", overwrite=False):
-    """
-    dataset = datasets.load_dataset("FreedomIntelligence/huatuo_encyclopedia_qa")
-    """
-    np.random.seed(42)
-    assert key in ["train", "test", "validation"]
-    path = project_dir / "dataset" / "huatuo_encyclopedia_qa_512" / f"{key}.jsonl"
-    questions = list(dataset[key]["questions"])
-    for i in range(len(questions)):
-        assert len(questions[i]) == 1
-        # choose one question randomly because they are similar
-        questions[i] = np.random.choice(questions[i][0]).item()
-    answers = list(dataset[key]["answers"])
-    for i in range(len(answers)):
-        assert len(answers[i]) == 1
-        answers[i] = answers[i][0]
-    indexes = []
-    for i in range(len(questions)):
-        if len(questions[i]) < 512 and len(answers[i]) < 512:
-            indexes.append(i)
-    df = pd.DataFrame(
-        {
-            "question": [questions[i] for i in indexes],
-            "answer": [answers[i] for i in indexes],
-        }
+def load_nq_dataset(max_query_len=64, max_passage_len=512):
+    dataset = datasets.load_dataset("sentence-transformers/natural-questions")
+    dataset = dataset.filter(
+        lambda x: len(x["query"]) <= max_query_len
+        and len(x["answer"]) <= max_passage_len
     )
-    save_jsonl(df, path, overwrite=overwrite)
-
-
-def load_dataset(tokenizer: PreTrainedTokenizerBase, ds_type="test"):
-    assert ds_type in ["train", "test", "validation"]
-    path = project_dir / "dataset" / "huatuo_encyclopedia_qa_512"
-    dataset = DPRDataset(path / f"{ds_type}.jsonl", tokenizer)
+    dataset = dataset["train"].train_test_split(test_size=0.05, seed=42)
     return dataset
 
 
 class DPRDataset(Dataset):
     def __init__(
-        self, file_path: str, tokenizer: PreTrainedTokenizerBase, max_length: int = 512
+        self,
+        dataset: datasets.Dataset,
+        tokenizer: PreTrainedTokenizerBase,
+        max_query_len=64,
+        max_passage_len: int = 512,
     ):
         super().__init__()
         self.tokenizer = tokenizer
-        self.max_length = max_length
-        self.samples = load_jsonl(file_path)
+        self.max_query_len = max_query_len
+        self.max_passage_len = max_passage_len
+        self.dataset = dataset
 
     def __len__(self):
-        return len(self.samples)
+        return len(self.dataset)
 
     def __getitem__(self, index):
-        sample = self.samples.iloc[index]
+        sample = self.dataset[index]
 
-        def encode(key):
+        def encode(key, max_length):
             inputs = self.tokenizer(
                 sample[key],
-                max_length=self.max_length,
+                max_length=max_length,
                 truncation=True,
                 return_tensors="pt",
                 padding_side="right",
@@ -145,13 +126,13 @@ class DPRDataset(Dataset):
             inputs["attention_mask"] = inputs["attention_mask"].squeeze(0)
             return inputs
 
-        query_inputs = encode("question")
-        passage_inputs = encode("answer")
+        query_inputs = encode("query", self.max_query_len)
+        passage_inputs = encode("answer", self.max_passage_len)
         return query_inputs, passage_inputs
 
 
 # ----- model -----
-class Retriever(nn.Module):
+class Encoder(nn.Module):
     """
     Adapted from CMU-11-667 (https://cmu-llms.org/) EncoderModel
     """
@@ -166,21 +147,21 @@ class Retriever(nn.Module):
         query_inputs: BatchEncoding = None,
         passage_inputs: BatchEncoding = None,
     ):
-        q_reps = (
+        q_embeddings = (
             self.encode(query_inputs) if query_inputs else None
         )  # (n_queries, hidden_dim)
-        p_reps = (
+        p_embeddings = (
             self.encode(passage_inputs) if passage_inputs else None
         )  # (n_passages, hidden_dim)
 
         # for inference
-        if q_reps is None or p_reps is None:
-            return q_reps, p_reps
+        if q_embeddings is None or p_embeddings is None:
+            return q_embeddings, p_embeddings
 
         similarity = (
-            torch.matmul(q_reps, p_reps.T) / self.temperature
+            torch.matmul(q_embeddings, p_embeddings.T) / self.temperature
         )  # (n_queries, n_passages)
-        target = torch.arange(len(q_reps)).to(q_reps.device)  # (n_queries,)
+        target = torch.arange(len(q_embeddings)).to(q_embeddings.device)  # (n_queries,)
         loss = F.cross_entropy(similarity, target)
         return loss, similarity
 
@@ -198,7 +179,8 @@ class Retriever(nn.Module):
         """
         attention_mask = torch.where(
             attention_mask == 1,
-            attention_mask + torch.arange(attention_mask.shape[1]).to(attention_mask.device),
+            attention_mask
+            + torch.arange(attention_mask.shape[1]).to(attention_mask.device),
             0,
         )  # (batch_size, seq_len)
         last_nonzero_indices = attention_mask.argmax(
@@ -213,6 +195,121 @@ class Retriever(nn.Module):
         last_hidden_state = last_hidden_state.squeeze(1)  # (batch_size, hidden_dim)
         reps = F.normalize(last_hidden_state, p=2, dim=1)
         return reps
+
+
+@torch.inference_mode()
+def similarity_bert(model_bert, queries: List[str], passages: List[str]):
+    if isinstance(queries, str):
+        queries = [queries]
+    if isinstance(passages, str):
+        passages = [passages]
+    q_embeddings = model_bert.encode(queries)  # (n_queries, hidden_dim)
+    p_embeddings = model_bert.encode(passages)  # (n_passages, hidden_dim)
+    similarity = model_bert.similarity(
+        q_embeddings, p_embeddings
+    )  # (n_queries, n_passages)
+    target = torch.arange(len(q_embeddings)).to(q_embeddings.device)  # (n_queries,)
+    loss = F.cross_entropy(similarity, target)
+    return loss, similarity
+
+
+@torch.inference_mode()
+def calc_relative_advantage(similarity):
+    """
+    similarity: (n_queries, n_passages)
+    """
+    sorted_similarity = torch.sort(similarity, 1, descending=True)[0]
+    second_best = sorted_similarity[:, 1]
+    return (torch.diag(similarity) - second_best) / second_best
+
+
+class BM25:
+    """
+    bm25 = BM25(k1=0.9, b=0.4)
+    bm.index(corpus)
+    bm.retrieve(queries, top_k=100)
+    """
+
+    def __init__(self, pattern=r"(?u)\b\w\w+\b", k1=0.9, b=0.4):
+        """
+        The default `k1` and `b` are consistent with Karpukhin et al. (2020).
+        """
+        self.pattern = re.compile(pattern)
+        self.k1 = k1
+        self.b = b
+
+    def split(self, text: str):
+        text = text.lower()
+        text = self.pattern.findall(text)
+        return text
+
+    def index(self, corpus: List[str]):
+        self.chunk_lens = []
+        self.freqs = []
+        token_to_num_chunks = Counter()
+        if isinstance(corpus, str):
+            corpus = [corpus]
+        for text in tqdm(corpus):
+            tokens = self.split(text)
+            chunk_len = len(tokens)
+            freqs = {}
+            for token in tokens:
+                if token not in freqs:
+                    freqs[token] = 1
+                    token_to_num_chunks[token] += 1
+                else:
+                    freqs[token] += 1
+            self.chunk_lens.append(chunk_len)
+            self.freqs.append(freqs)
+        self.num_chunks = len(self.chunk_lens)
+        self.mean_chunk_len = np.mean(self.chunk_lens).item()
+        self.token_to_num_chunks = dict(token_to_num_chunks)
+
+    def retrieve(self, queries: List[str], top_k=100):
+        if isinstance(queries, str):
+            queries = [queries]
+        results = []
+        for query in tqdm(queries):
+            result = self._retrieve(query, top_k)
+            results.append(result)
+        indexes = np.stack([result[0] for result in results])
+        scores = np.stack([result[1] for result in results])
+        return indexes, scores
+
+    def _retrieve(self, query: str, top_k=100):
+        if top_k is None:
+            top_k = self.num_chunks
+        assert top_k <= self.num_chunks
+        query_tokens = self.split(query)
+        scores = np.zeros(self.num_chunks, dtype=float)
+        for chunk_index in range(self.num_chunks):
+            score = self.score(query_tokens, chunk_index)
+            scores[chunk_index] = score
+        indexes = np.argsort(-scores)[:top_k]
+        scores = scores[indexes]
+        return indexes, scores
+
+    def score(self, query_tokens: List[str], chunk_index: int):
+        chunk_len = self.chunk_lens[chunk_index]
+        n = np.array(
+            list(
+                map(lambda token: self.token_to_num_chunks.get(token, 0), query_tokens)
+            )
+        )
+        freqs = np.array(
+            list(map(lambda token: self.freqs[chunk_index].get(token, 0), query_tokens))
+        )
+        IDF = self.calc_IDF(n)
+        weight = freqs / (
+            freqs + self.k1 * (1 - self.b + self.b * chunk_len / self.mean_chunk_len)
+        )
+        return np.sum(IDF * weight)
+
+    def calc_IDF(self, n: int):
+        """
+        n: number of chunks containing the term
+        """
+        return np.log((self.num_chunks - n + 0.5) / (n + 0.5) + 1)
 
 
 # ----- train -----
@@ -234,7 +331,8 @@ class TrainArgs:
     save_interval: int = 100  # 模型保存间隔
     hidden_size: int = 512  # 隐藏层维度
     num_hidden_layers: int = 8  # 隐藏层数量
-    max_seq_len: int = 512  # 训练的最大截断长度
+    max_query_len: int = 64
+    max_passage_len: int = 512
     use_amp: bool = None  # 使用自动混合精度
     temperature: float = 1.0
     data_path: Union[str, Path] = (
@@ -244,6 +342,7 @@ class TrainArgs:
     from_resume: int = 0  # 是否自动检测&续训（0=否，1=是）
     use_wandb: bool = False
     use_swanlab: bool = False
+    use_bert: bool = (False,)
     wandb_entity: str = None
     wandb_project: str = "MiniMind"
     profile: bool = False
@@ -260,6 +359,11 @@ class TrainArgs:
         self.data_path = self.data_path.as_posix()
         if self.profile:
             self.use_wandb = False
+        self.wandb = wandb
+        if self.use_swanlab:
+            import swanlab
+
+            self.wandb = swanlab
 
 
 def get_num_params(model):
@@ -284,6 +388,7 @@ def train_epoch(
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
     start_time = time.time()
     grad_norm = float("nan")
+    wandb = args.wandb
 
     def get_spend_time():
         return spend_time + time.time() - start_time
@@ -295,7 +400,7 @@ def train_epoch(
             print("data to deivce:", get_spend_time())
 
         with torch.autocast(device_type=args.device, enabled=args.use_amp, dtype=dtype):
-            loss = model(query_inputs, passage_inputs)[0]
+            loss, similarity = model(query_inputs, passage_inputs)
             if args.profile:
                 torch.cuda.synchronize()
                 print("forward:", get_spend_time())
@@ -321,13 +426,22 @@ def train_epoch(
             torch.cuda.empty_cache()
 
             if use_wandb:
+                adv = (
+                    calc_relative_advantage(similarity)
+                    .mean()
+                    .detach()
+                    .cpu()
+                    .numpy()
+                    .item()
+                )
                 wandb.log(
                     {
-                        "train_step": step // args.accumulation_steps + 1,
+                        "train_step": step // args.accumulation_steps,
                         "train/epoch": epoch + 1,
                         "train/loss": loss,
                         "train/lr": lr,
                         "train/grad_norm": grad_norm,
+                        "train/adv": adv,
                         "train/time": get_spend_time(),
                     }
                 )
@@ -354,8 +468,6 @@ def train_epoch(
             torch.save(state_dict, ckp)
             wandb_id = None
             if args.use_wandb:
-                if args.use_swanlab:
-                    import swanlab as wandb
                 wandb_id = getattr(wandb.run, "id", None)
             lm_checkpoint(
                 lm_config,
@@ -412,10 +524,16 @@ def train(
             save_dir=args.save_dir,
             device=args.device,
         )
-        model = Retriever(model, temperature=args.temperature)
+        model = Encoder(model, temperature=args.temperature)
     num_params = get_num_params(model)
     if train_ds is None:
-        train_ds = DPRDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
+        train_ds = load_nq_dataset(args.max_query_len, args.max_passage_len)
+        train_ds = DPRDataset(
+            train_ds["train"],
+            tokenizer,
+            max_query_len=args.max_query_len,
+            max_passage_len=args.max_passage_len,
+        )
 
     if early_return:  # for debugging
         return model, tokenizer, train_ds
@@ -474,8 +592,7 @@ def train(
     run = nullcontext()
     use_wandb = args.use_wandb and is_main_process()
     if use_wandb:
-        if args.use_swanlab:
-            import swanlab as wandb
+        wandb = args.wandb
         wandb_id = ckp_data.get("wandb_id") if ckp_data else None
         resume = "must" if wandb_id else None
         wandb_run_name = f"MiniMind-{round(num_params/1e6)}M-{args.save_weight}-epoch-{args.epochs}-batchsize-{args.batch_size}-lr-{args.learning_rate}"
@@ -490,11 +607,11 @@ def train(
                 "wandb_project",
                 "save_dir",
                 "data_path",
-                "pre_trained_model_path",
             ]:
                 config.pop(key)
             config["max_step"] = max_step
             config["num_params"] = num_params
+            config["dataset_name"] = args.dataset_name
         wandb_kwargs = dict(
             entity=args.wandb_entity,
             project=args.wandb_project,
