@@ -23,11 +23,10 @@ from collections import Counter
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 import json
-from multiprocessing import Pool
 import os
 import re
 import time
-from typing import List, Union
+from typing import List, Literal, Union
 import warnings
 
 import datasets
@@ -40,7 +39,15 @@ from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
 from tqdm import tqdm, trange
-from transformers import BatchEncoding, PreTrainedModel, PreTrainedTokenizerBase
+from transformers import (
+    AutoModel,
+    AutoTokenizer,
+    BatchEncoding,
+    BertModel,
+    BertTokenizerFast,
+    PreTrainedModel,
+    PreTrainedTokenizerBase,
+)
 import wandb
 
 from model.model_minimind import MiniMindConfig
@@ -49,7 +56,6 @@ from trainer.trainer_utils import (
     MiniMindForCausalLM,
     SkipBatchSampler,
     init_distributed_mode,
-    init_model,
     is_main_process,
     lm_checkpoint,
     setup_seed,
@@ -82,8 +88,12 @@ def load_jsonl(path):
     return data
 
 
-def load_nq_dataset(max_query_len=64, max_passage_len=512):
-    dataset = datasets.load_dataset("sentence-transformers/natural-questions")
+def load_dataset(
+    dataset="sentence-transformers/natural-questions",
+    max_query_len=64,
+    max_passage_len=512,
+):
+    dataset = datasets.load_dataset(dataset)
     dataset = dataset.filter(
         lambda x: len(x["query"]) <= max_query_len
         and len(x["answer"]) <= max_passage_len
@@ -113,8 +123,12 @@ class DPRDataset(Dataset):
         sample = self.dataset[index]
 
         def encode(key, max_length):
+            if isinstance(self.tokenizer, BertTokenizerFast):
+                text = sample[key]
+            else:
+                text = self.tokenizer.bos_token + sample[key] + self.tokenizer.eos_token
             inputs = self.tokenizer(
-                sample[key],
+                text,
                 max_length=max_length,
                 truncation=True,
                 return_tensors="pt",
@@ -122,8 +136,8 @@ class DPRDataset(Dataset):
                 padding="max_length",
                 return_token_type_ids=False,
             )
-            inputs["input_ids"] = inputs["input_ids"].squeeze(0)
-            inputs["attention_mask"] = inputs["attention_mask"].squeeze(0)
+            inputs["input_ids"] = inputs["input_ids"].view(-1)
+            inputs["attention_mask"] = inputs["attention_mask"].view(-1)
             return inputs
 
         query_inputs = encode("query", self.max_query_len)
@@ -140,7 +154,7 @@ class Encoder(nn.Module):
     def __init__(self, encoder: PreTrainedModel, temperature: float = 1.0):
         super().__init__()
         self.encoder = encoder
-        self.temperature = temperature
+        self.register_buffer("temperature", torch.tensor(temperature))
 
     def forward(
         self,
@@ -175,30 +189,36 @@ class Encoder(nn.Module):
         """
         last_hidden_state: (batch_size, seq_len, hidden_dim)
         attention_mask: (batch_size, seq_len)
-        reps: (batch_size, hidden_dim)
+        embeddings: (batch_size, hidden_dim)
         """
-        attention_mask = torch.where(
-            attention_mask == 1,
-            attention_mask
-            + torch.arange(attention_mask.shape[1]).to(attention_mask.device),
-            0,
-        )  # (batch_size, seq_len)
-        last_nonzero_indices = attention_mask.argmax(
-            dim=1, keepdim=True
-        )  # (batch_size, 1)
-        last_token_indices = last_nonzero_indices.unsqueeze(-1).expand(
-            -1, -1, last_hidden_state.shape[-1]
-        )  # (batch_size, 1, hidden_dim)
-        last_hidden_state = torch.gather(
-            last_hidden_state, 1, last_token_indices
-        )  # (batch_size, 1, hidden_dim)
-        last_hidden_state = last_hidden_state.squeeze(1)  # (batch_size, hidden_dim)
-        reps = F.normalize(last_hidden_state, p=2, dim=1)
-        return reps
+        if isinstance(self.encoder, BertModel):
+            last_hidden_state = last_hidden_state[:, 0, :]  # (batch_size, hidden_dim)
+        else:
+            attention_mask = torch.where(
+                attention_mask == 1,
+                attention_mask
+                + torch.arange(attention_mask.shape[1]).to(attention_mask.device),
+                0,
+            )  # (batch_size, seq_len)
+            last_nonzero_indices = attention_mask.argmax(
+                dim=1, keepdim=True
+            )  # (batch_size, 1)
+            last_token_indices = last_nonzero_indices.unsqueeze(-1).expand(
+                -1, -1, last_hidden_state.shape[-1]
+            )  # (batch_size, 1, hidden_dim)
+            last_hidden_state = torch.gather(
+                last_hidden_state, 1, last_token_indices
+            )  # (batch_size, 1, hidden_dim)
+            last_hidden_state = last_hidden_state.squeeze(1)  # (batch_size, hidden_dim)
+        embeddings = F.normalize(last_hidden_state, p=2, dim=1)
+        return embeddings
 
 
 @torch.inference_mode()
 def similarity_bert(model_bert, queries: List[str], passages: List[str]):
+    from sentence_transformers import SentenceTransformer
+
+    model_bert: SentenceTransformer = model_bert  # for type hint
     if isinstance(queries, str):
         queries = [queries]
     if isinstance(passages, str):
@@ -221,6 +241,70 @@ def calc_relative_advantage(similarity):
     sorted_similarity = torch.sort(similarity, 1, descending=True)[0]
     second_best = sorted_similarity[:, 1]
     return (torch.diag(similarity) - second_best) / second_best
+
+
+@torch.inference_mode()
+def benchmark_retriever(
+    model: Union[Literal["bm25"], Encoder],
+    dataset: DPRDataset,
+    top_k=[20, 40, 60, 80, 100],
+    batch_size=256,
+    save_path: str = None,
+):
+    if not np.iterable(top_k):
+        top_k = [top_k]
+    max_top_k = max(top_k)
+    top_k = sorted(top_k)
+    queries = list(dataset.dataset["query"])
+    passages = list(dataset.dataset["answer"])
+    if isinstance(model, str):
+        if model == "bm25":
+            import bm25s
+
+            corpus_tokens = bm25s.tokenize(passages, stopwords="en")
+            retriever = bm25s.BM25(k1=0.9, b=0.4)
+            retriever.index(corpus_tokens)
+            query_tokens = bm25s.tokenize(queries)
+            indices = retriever.retrieve(query_tokens, k=max_top_k)[0]
+        else:
+            raise NotImplementedError
+    elif isinstance(model, Encoder):
+        loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+        all_q_embeddings = []
+        all_p_embeddings = []
+        device = model.encoder.device
+        for query_inputs, passage_inputs in tqdm(loader):
+            q_embeddings = model.encode(
+                query_inputs.to(device)
+            )  # (batch_size, hidden_dim)
+            p_embeddings = model.encode(
+                passage_inputs.to(device)
+            )  # (batch_size, hidden_dim)
+            all_q_embeddings.append(q_embeddings)
+            all_p_embeddings.append(p_embeddings)
+        q_embeddings = torch.cat(all_q_embeddings, dim=0)  # (n_queries, hidden_dim)
+        p_embeddings = torch.cat(all_p_embeddings, dim=0)  # (n_passages, hidden_dim)
+        similarity = q_embeddings @ p_embeddings.T  # (n_queries, n_passages)
+        values, indices = torch.topk(similarity, k=max_top_k, dim=1)
+        indices = indices.cpu().numpy()
+    else:  # sentence-transformers
+        similarity = similarity_bert(model, queries, passages)[1]
+        values, indices = torch.topk(similarity, k=max_top_k, dim=1)
+        indices = indices.cpu().numpy()
+    targets = np.arange(len(indices))[:, None]
+    accuracy = {}
+    for _top_k in top_k:
+        acc = np.any(indices[:, :_top_k] == targets, 1).mean().item()
+        accuracy[_top_k] = acc
+    torch.cuda.empty_cache()
+    return accuracy
+    breakpoint()
+    queries = list(dataset["query"])
+    passages = list(dataset["answer"])
+
+    if save_path is not None:
+        save_path = Path(save_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
 
 
 class BM25:
@@ -272,9 +356,9 @@ class BM25:
         for query in tqdm(queries):
             result = self._retrieve(query, top_k)
             results.append(result)
-        indexes = np.stack([result[0] for result in results])
+        indices = np.stack([result[0] for result in results])
         scores = np.stack([result[1] for result in results])
-        return indexes, scores
+        return indices, scores
 
     def _retrieve(self, query: str, top_k=100):
         if top_k is None:
@@ -285,9 +369,9 @@ class BM25:
         for chunk_index in range(self.num_chunks):
             score = self.score(query_tokens, chunk_index)
             scores[chunk_index] = score
-        indexes = np.argsort(-scores)[:top_k]
-        scores = scores[indexes]
-        return indexes, scores
+        indices = np.argsort(-scores)[:top_k]
+        scores = scores[indices]
+        return indices, scores
 
     def score(self, query_tokens: List[str], chunk_index: int):
         chunk_len = self.chunk_lens[chunk_index]
@@ -317,15 +401,15 @@ class BM25:
 class TrainArgs:
     save_dir: Union[str, Path] = project_dir / "checkpoints"  # 模型保存目录
     save_weight: str = "dpr"  # 保存权重的前缀名
-    epochs: int = 1  # 训练轮数（建议1轮zero或2-6轮充分训练
-    batch_size: int = 16
-    learning_rate: float = 1e-4
+    epochs: int = 1  # 训练轮数
+    batch_size: int = 64
+    learning_rate: float = 4e-6
     weight_decay: float = 0.0
     betas: tuple = (0.9, 0.999)
     device: str = None
     dtype: str = "bfloat16"
     num_workers: int = 0  # 数据加载线程数
-    accumulation_steps: int = 2  # 梯度累积步数
+    accumulation_steps: int = 1  # 梯度累积步数
     grad_clip: float = 1.0  # 梯度裁剪阈值
     log_interval: int = 100  # 日志打印间隔
     save_interval: int = 100  # 模型保存间隔
@@ -335,14 +419,12 @@ class TrainArgs:
     max_passage_len: int = 512
     use_amp: bool = None  # 使用自动混合精度
     temperature: float = 1.0
-    data_path: Union[str, Path] = (
-        project_dir / "dataset/huatuo_encyclopedia_qa_512/train.jsonl"
-    )
     from_weight: str = "pretrain"  # 基于哪个权重训练，为none则从头开始
     from_resume: int = 0  # 是否自动检测&续训（0=否，1=是）
+    dataset: str = "sentence-transformers/natural-questions"
     use_wandb: bool = False
     use_swanlab: bool = False
-    use_bert: bool = (False,)
+    train_bert: bool = True
     wandb_entity: str = None
     wandb_project: str = "MiniMind"
     profile: bool = False
@@ -354,9 +436,8 @@ class TrainArgs:
         if self.use_amp is None:
             self.use_amp = "cuda" in self.device
         self.save_dir = Path(self.save_dir).as_posix()
-        self.data_path = Path(self.data_path)
-        self.dataset_name = self.data_path.name
-        self.data_path = self.data_path.as_posix()
+        if self.train_bert:
+            self.hidden_size = 256  # BERT-mini
         if self.profile:
             self.use_wandb = False
         self.wandb = wandb
@@ -368,6 +449,36 @@ class TrainArgs:
 
 def get_num_params(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+def init_model(
+    lm_config,
+    from_weight="pretrain",
+    tokenizer_path="../model",
+    save_dir="../out",
+    device="cuda",
+    bert=False,
+):
+    if bert:
+        model = AutoModel.from_pretrained("prajjwal1/bert-mini")
+        tokenizer = AutoTokenizer.from_pretrained("prajjwal1/bert-mini")
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+        model = MiniMindForCausalLM(lm_config)
+    model = Encoder(model, temperature=1.0)
+
+    if from_weight != "none":
+        moe_suffix = "_moe" if lm_config.use_moe else ""
+        weight_path = (
+            f"{save_dir}/{from_weight}_{lm_config.hidden_size}{moe_suffix}.pth"
+        )
+        weights = torch.load(weight_path, map_location=device)
+        model.load_state_dict(weights, strict=False)
+
+    Logger(
+        f"所加载Model可训练参数：{sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.3f} 百万"
+    )
+    return model.to(device), tokenizer
 
 
 def train_epoch(
@@ -388,6 +499,7 @@ def train_epoch(
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
     start_time = time.time()
     grad_norm = float("nan")
+    adv = float("nan")
     wandb = args.wandb
 
     def get_spend_time():
@@ -449,7 +561,7 @@ def train_epoch(
         if bar is not None:
             bar.update()
             bar.set_postfix_str(
-                f"[{epoch+1}/{args.epochs}]loss={round(loss, 4)},grad_norm={round(grad_norm, 4)}"
+                f"[{epoch+1}/{args.epochs}]loss={loss:.4f},adv={adv:.4f},grad_norm={grad_norm:.4f}"
             )
 
         if step % args.log_interval == 0 or step == iters - 1:
@@ -523,20 +635,27 @@ def train(
             tokenizer_path=project_dir / "model",
             save_dir=args.save_dir,
             device=args.device,
+            bert=args.train_bert,
         )
-        model = Encoder(model, temperature=args.temperature)
+        # model = Encoder(model, temperature=args.temperature)
     num_params = get_num_params(model)
     if train_ds is None:
-        train_ds = load_nq_dataset(args.max_query_len, args.max_passage_len)
+        dataset = load_dataset(args.dataset, args.max_query_len, args.max_passage_len)
         train_ds = DPRDataset(
-            train_ds["train"],
+            dataset["train"],
+            tokenizer,
+            max_query_len=args.max_query_len,
+            max_passage_len=args.max_passage_len,
+        )
+        test_ds = DPRDataset(
+            dataset["test"],
             tokenizer,
             max_query_len=args.max_query_len,
             max_passage_len=args.max_passage_len,
         )
 
     if early_return:  # for debugging
-        return model, tokenizer, train_ds
+        return model, tokenizer, train_ds, test_ds
 
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
     scaler = torch.GradScaler(args.device, enabled=(args.dtype == "float16"))
@@ -606,12 +725,10 @@ def train(
                 "use_wandb",
                 "wandb_project",
                 "save_dir",
-                "data_path",
             ]:
                 config.pop(key)
             config["max_step"] = max_step
             config["num_params"] = num_params
-            config["dataset_name"] = args.dataset_name
         wandb_kwargs = dict(
             entity=args.wandb_entity,
             project=args.wandb_project,
