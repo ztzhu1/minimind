@@ -19,6 +19,7 @@ project_path = project_dir.as_posix()
 if project_path not in sys.path:
     sys.path.insert(0, project_path)
 
+import argparse
 from collections import Counter
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
@@ -94,15 +95,31 @@ def load_jsonl(path):
 
 
 def load_dataset(
-    dataset="lighteval/ChineseSquad",
+    dataset_name="ChineseSquad",
     max_query_len=64,
     max_passage_len=128,
+    split=True,
 ):
-    dataset = datasets.load_dataset(dataset)
-    dataset = dataset.filter(
-        lambda x: len(x["question"]) <= max_query_len
-        and len(x["context"]) <= max_passage_len
-    )
+    if dataset_name == "ChineseSquad":
+        dataset_name = "lighteval/ChineseSquad"
+    elif dataset_name == "natural-questions":
+        dataset_name = "sentence-transformers/natural-questions"
+    else:
+        raise NotImplementedError
+
+    dataset = datasets.load_dataset(dataset_name)
+    if dataset_name == "sentence-transformers/natural-questions":
+        dataset = dataset.filter(
+            lambda x: len(x["query"]) <= max_query_len
+            and len(x["answer"]) <= max_passage_len
+        )
+        if split:
+            dataset = dataset["train"].train_test_split(test_size=0.05, seed=42)
+    else:
+        dataset = dataset.filter(
+            lambda x: len(x["question"]) <= max_query_len
+            and len(x["context"]) <= max_passage_len
+        )
     return dataset
 
 
@@ -119,6 +136,10 @@ class DPRDataset(Dataset):
         self.max_query_len = max_query_len
         self.max_passage_len = max_passage_len
         self.dataset = dataset
+        if "query" in self.dataset.features:
+            self.dataset_name = "nq"
+        else:
+            self.dataset_name = "cs"
 
     def __len__(self):
         return len(self.dataset)
@@ -144,12 +165,25 @@ class DPRDataset(Dataset):
             inputs["attention_mask"] = inputs["attention_mask"].view(-1)
             return inputs
 
-        query_inputs = encode("query", self.max_query_len)
-        passage_inputs = encode("answer", self.max_passage_len)
+        if self.dataset_name == "cs":  # ChineseSquad
+            query_inputs = encode("question", self.max_query_len)
+            passage_inputs = encode("context", self.max_passage_len)
+        else:  # natural-questions
+            query_inputs = encode("query", self.max_query_len)
+            passage_inputs = encode("answer", self.max_passage_len)
         return query_inputs, passage_inputs
 
+    def tolist(self):
+        if self.dataset_name == "cs":  # ChineseSquad
+            queries = list(self.dataset["question"])
+            passages = list(self.dataset["context"])
+        else:
+            queries = list(self.dataset["query"])
+            passages = list(self.dataset["answer"])
+        return queries, passages
 
-# ----- retriever model -----
+
+# ----- retriever -----
 
 
 class Encoder(nn.Module):
@@ -184,6 +218,27 @@ class Encoder(nn.Module):
         target = torch.arange(len(q_embeddings)).to(q_embeddings.device)  # (n_queries,)
         loss = F.cross_entropy(similarity, target)
         return loss, similarity
+
+    def encode_text(
+        self,
+        texts: Union[str, List[str]],
+        tokenizer: PreTrainedTokenizerBase,
+        max_length=128,
+    ):
+        if isinstance(texts, str):
+            texts = [texts]
+        texts = [tokenizer.bos_token + text + tokenizer.eos_token for text in texts]
+        inputs = tokenizer(
+            texts,
+            max_length=max_length,
+            truncation=True,
+            return_tensors="pt",
+            padding_side="right",
+            padding="max_length",
+            return_token_type_ids=False,
+        )
+        embeddings = self.encode(inputs.to(self.encoder.device))
+        return embeddings
 
     def encode(self, inputs: BatchEncoding):
         hidden_states = self.encoder(
@@ -252,15 +307,21 @@ def calc_relative_advantage(similarity):
 def benchmark_retriever(
     model: Union[Literal["bm25"], Encoder],
     dataset: DPRDataset,
-    top_k=[20, 40, 60, 80, 100],
+    top_k=[5, 20, 40, 60, 80, 100],
     batch_size=256,
 ):
     if not np.iterable(top_k):
         top_k = [top_k]
     max_top_k = max(top_k)
     top_k = sorted(top_k)
-    queries = list(dataset.dataset["query"])
-    passages = list(dataset.dataset["answer"])
+    queries, passages = dataset.tolist()
+    unique_queries = []
+    unique_passages = []
+    for i in range(len(passages)):
+        if passages[i] not in unique_passages:
+            unique_queries.append(queries[i])
+            unique_passages.append(passages[i])
+    queries, passages = unique_queries, unique_passages
     if isinstance(model, str):
         if model == "bm25":
             import bm25s
@@ -300,7 +361,7 @@ def benchmark_retriever(
     for _top_k in top_k:
         acc = np.any(indices[:, :_top_k] == targets, 1).mean().item()
         accuracy[_top_k] = acc
-    torch.cuda.empty_cache()
+    # torch.cuda.empty_cache()
     return accuracy
 
 
@@ -401,7 +462,7 @@ class TrainArgs:
     save_dir: Union[str, Path] = project_dir / "checkpoints"  # 模型保存目录
     save_weight: str = "dpr"  # 保存权重的前缀名
     epochs: int = 1  # 训练轮数
-    batch_size: int = 64
+    batch_size: int = 32
     learning_rate: float = 4e-6
     weight_decay: float = 0.0
     betas: tuple = (0.9, 0.999)
@@ -420,16 +481,16 @@ class TrainArgs:
     temperature: float = 1.0
     from_weight: str = "pretrain"  # 基于哪个权重训练，为none则从头开始
     from_resume: int = 0  # 是否自动检测&续训（0=否，1=是）
-    dataset: str = "sentence-transformers/natural-questions"
+    dataset: str = "ChineseSquad"
     use_wandb: bool = False
     use_swanlab: bool = False
-    train_bert: bool = True
+    train_bert: bool = False
     wandb_entity: str = None
     wandb_project: str = "MiniMind"
-    profile: bool = False
 
     def __post_init__(self):
         assert self.dtype in ["bfloat16", "float16"]
+        assert self.dataset in ["ChineseSquad", "natural-questions"]
         if self.device is None:
             self.device = "cuda:0" if torch.cuda.is_available() else "cpu"
         if self.use_amp is None:
@@ -437,8 +498,10 @@ class TrainArgs:
         self.save_dir = Path(self.save_dir).as_posix()
         if self.train_bert:
             self.hidden_size = 256  # BERT-mini
-        if self.profile:
-            self.use_wandb = False
+        self.model_dir = project_dir / "out"
+        if not self.model_dir.exists():
+            self.model_dir = project_dir / "checkpoints"
+        self.model_dir = self.model_dir.as_posix()
         self.wandb = wandb
         if self.use_swanlab:
             import swanlab
@@ -507,19 +570,12 @@ def train_epoch(
     for step, (query_inputs, passage_inputs) in enumerate(loader, start=start_step + 1):
         query_inputs = query_inputs.to(args.device)
         passage_inputs = passage_inputs.to(args.device)
-        if args.profile:
-            print("data to deivce:", get_spend_time())
 
         with torch.autocast(device_type=args.device, enabled=args.use_amp, dtype=dtype):
             loss, similarity = model(query_inputs, passage_inputs)
-            if args.profile:
-                torch.cuda.synchronize()
-                print("forward:", get_spend_time())
             loss = loss / args.accumulation_steps
 
         scaler.scale(loss).backward()
-        if args.profile:
-            print("backward:", get_spend_time())
         loss = loss.detach().cpu().numpy().item() * args.accumulation_steps
         lr = optimizer.param_groups[-1]["lr"]
 
@@ -547,7 +603,8 @@ def train_epoch(
                 )
                 wandb.log(
                     {
-                        "train_step": step // args.accumulation_steps,
+                        "train_step": (epoch * len(loader) + step)
+                        // args.accumulation_steps,
                         "train/epoch": epoch + 1,
                         "train/loss": loss,
                         "train/lr": lr,
@@ -566,8 +623,6 @@ def train_epoch(
         if step % args.log_interval == 0 or step == iters - 1:
             Logger(f"Epoch:[{epoch+1}/{args.epochs},{step}/{iters}] loss:{loss:.4f}")
 
-        if args.profile:
-            return
         if (step % args.save_interval == 0 or step == iters - 1) and is_main_process():
             model.eval()
             ckp = f"{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}.pth"
@@ -632,7 +687,7 @@ def train(
             lm_config,
             args.from_weight,
             tokenizer_path=project_dir / "model",
-            save_dir=args.save_dir,
+            save_dir=args.model_dir,
             device=args.device,
             bert=args.train_bert,
         )
@@ -646,8 +701,9 @@ def train(
             max_query_len=args.max_query_len,
             max_passage_len=args.max_passage_len,
         )
+        key = "validation" if args.dataset == "ChineseSquad" else "test"
         test_ds = DPRDataset(
-            dataset["test"],
+            dataset[key],
             tokenizer,
             max_query_len=args.max_query_len,
             max_passage_len=args.max_passage_len,
@@ -774,62 +830,16 @@ def train(
                 use_wandb=use_wandb,
                 spend_time=spend_time,
             )
-            if args.profile:
-                return
     bar.close()
 
 
 # ----- RAG -----
 
 
-def init_rag(device, documents: Union[List[str], datasets.Dataset] = None):
-    print("loading models and encoding documents, this may take a while...")
-    retriver = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
-    retriver.to(device)
-    retriver.eval()
-    reranker = AutoModelForSequenceClassification.from_pretrained(
-        "jinaai/jina-reranker-v2-base-multilingual", trust_remote_code=True
-    )
-    reranker.to(device)
-    reranker.eval()
-    return retriver, reranker
-    if documents is None:
-        documents = load_dataset()
-        documents = documents["train"]["answer"]
-    doc_embeddings = retriver.encode(
-        documents, convert_to_tensor=True, show_progress_bar=True
-    )
-    return retriver, reranker, doc_embeddings
-
-
-@torch.inference_mode()
-def retrive(
-    query: str,
-    retriver: SentenceTransformer,
-    reranker: PreTrainedModel,
-    documents: List[str],
-    doc_embeddings: torch.Tensor,
-    top_k=20,
-):
-    """
-    corpus_embeddings: (n_passages, hidden_dim)
-    """
-    query_embeddings = retriver.encode(query, convert_to_tensor=True)  # (hidden_dim,)
-    similarity = doc_embeddings @ query_embeddings
-    values, indices = torch.topk(similarity, k=top_k)
-    indices = indices.cpu().numpy()
-    sentence_pairs = [[query, documents[i]] for i in indices]
-    scores = reranker.compute_score(sentence_pairs)
-    max_index = indices[np.argsort(scores)[-1]]
-    return max_index.item(), documents[max_index]
-
-
 @dataclass
 class EvalArgs:
     load_from: str = "model"
-    save_dir: str = "out"
     weight: str = "full_sft"
-    lora_weight: str = "None"
     hidden_size: int = 768
     num_hidden_layers: int = 16
     use_moe: int = 0
@@ -839,19 +849,102 @@ class EvalArgs:
     top_p: float = 0.85
     top_k: int = 20
     rag: bool = True
+    max_query_len: int = 64
+    max_passage_len: int = 128
     historys: int = 0
+    use_sbert_retriever: bool = True
     device: str = None
 
     def __post_init__(self):
         if self.device is None:
             self.device = "cuda:0" if torch.cuda.is_available() else "cpu"
-        self.save_dir = Path(self.save_dir).as_posix()
+        self.model_dir = project_dir / "out"
+        if not self.model_dir.exists():
+            self.model_dir = project_dir / "checkpoints"
+        self.model_dir = self.model_dir.as_posix()
+
+
+@torch.inference_mode()
+def init_rag(
+    device,
+    documents: Union[List[str], datasets.Dataset] = None,
+    retriever: Encoder = None,
+    tokenizer: PreTrainedTokenizerBase = None,
+    max_length=128,
+):
+    print("loading models and encoding documents, this may take a while...")
+    if retriever is None:
+        retriever = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
+        encode_fn = lambda retriever: retriever.encode_text(
+            documents, convert_to_tensor=True, show_progress_bar=True
+        )
+    else:
+
+        def encode_fn(retriever: Encoder):
+            all_p_embeddings = []
+            batch_size = 128
+            step = int(np.ceil(len(documents) / batch_size))
+            for i in trange(step):
+                docs = documents[i * batch_size : (i + 1) * batch_size]
+                p_embeddings = retriever.encode_text(
+                    docs, tokenizer, max_length=max_length
+                )
+                all_p_embeddings.append(p_embeddings)
+            p_embeddings = torch.cat(
+                all_p_embeddings, dim=0
+            )  # (n_passages, hidden_dim)
+            return p_embeddings
+
+    retriever.to(device)
+    retriever.eval()
+    reranker = AutoModelForSequenceClassification.from_pretrained(
+        "jinaai/jina-reranker-v2-base-multilingual", trust_remote_code=True
+    )
+    reranker.to(device)
+    reranker.eval()
+    # return retriever, reranker
+    if documents is None:
+        documents = load_dataset()
+        documents = documents["train"]["context"]
+    doc_embeddings = encode_fn(retriever)
+    return retriever, reranker, doc_embeddings
+
+
+@torch.inference_mode()
+def retrieve(
+    query: str,
+    retriever: Union[SentenceTransformer, Encoder],
+    reranker: PreTrainedModel,
+    documents: List[str],
+    doc_embeddings: torch.Tensor,
+    top_k=20,
+    tokenizer=None,
+    max_length=128,
+):
+    """
+    corpus_embeddings: (n_passages, hidden_dim)
+    """
+    if isinstance(retriever, SentenceTransformer):
+        query_embeddings = retriever.encode_text(
+            query, convert_to_tensor=True
+        )  # (hidden_dim,)
+    else:
+        query_embeddings = retriever.encode_text(
+            query, tokenizer, max_length=max_length
+        )[0]
+    similarity = doc_embeddings @ query_embeddings
+    values, indices = torch.topk(similarity, k=top_k)
+    indices = indices.cpu().numpy()
+    sentence_pairs = [[query, documents[i]] for i in indices]
+    scores = reranker.compute_score(sentence_pairs)
+    max_index = indices[np.argsort(scores)[-1]]
+    return max_index.item(), documents[max_index]
 
 
 @torch.inference_mode()
 def evaluate(
-    args,
-    retriver: SentenceTransformer,
+    args: EvalArgs,
+    retriever: SentenceTransformer,
     reranker: PreTrainedModel,
     documents: List[str],
     doc_embeddings: torch.Tensor,
@@ -861,7 +954,8 @@ def evaluate(
     prompts = ['介绍音乐剧"Hamilton"', "YouTube上观看量最高的视频是什么"]
 
     conversation = []
-    model, tokenizer = init_model(args)
+    if model is None:
+        model, tokenizer = init_model(args)
     input_mode = int(input("[0] 自动测试\n[1] 手动输入\n"))
     streamer = TextStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
 
@@ -871,8 +965,15 @@ def evaluate(
         if input_mode == 0:
             print(f"👶: {prompt}")
         if args.rag:
-            doc = retrive(
-                prompt, retriver, reranker, documents, doc_embeddings, top_k=args.top_k
+            doc = retrieve(
+                prompt,
+                retriever,
+                reranker,
+                documents,
+                doc_embeddings,
+                top_k=args.top_k,
+                tokenizer=tokenizer,
+                max_length=args.max_passage_len,
             )[1]
             prompt = f'你是一个智能问答助手，请严格按照以下要求回答问题： 如果资料中包含问题答案，请直接使用资料信息并注明"根据资料"，如果资料不相关、信息不足或未包含答案，请明确说明"资料中未包含相关信息"，然后可以基于常识进行补充\n资料：{doc}\n问题：{prompt}\n现在请开始回答：'
         conversation = conversation[-args.historys :] if args.historys else []
@@ -910,3 +1011,105 @@ def evaluate(
         )
         conversation.append({"role": "assistant", "content": response})
         print("")
+
+
+if __name__ == "__main__":
+    # fmt: off
+    parser = argparse.ArgumentParser(description="MiniMind检索增强的模型推理与对话(RAG)")
+    parser.add_argument('--mode', default='eval', type=str, choices=['train', 'eval'], help="运行模式（train=训练检索模型）")
+    parser.add_argument('--load_from', default='model', type=str, help="(eval) 模型加载路径（model=原生torch权重，其他路径=transformers格式）")
+    parser.add_argument('--save_dir', default='out', type=str, help="(train) retriever模型权重目录")
+    parser.add_argument('--weight', default='full_sft', type=str, help="权重名称前缀（pretrain, full_sft, rlhf, reason, ppo_actor, grpo, spo）")
+    parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--batch_size", type=int, default=32, help="batch size")
+    parser.add_argument("--learning_rate", type=float, default=4e-6, help="初始学习率")
+    parser.add_argument("--dtype", type=str, default="bfloat16", help="混合精度类型")
+    parser.add_argument("--accumulation_steps", type=int, default=8, help="梯度累积步数")
+    parser.add_argument("--grad_clip", type=float, default=1.0, help="梯度裁剪阈值")
+    parser.add_argument("--log_interval", type=int, default=100, help="日志打印间隔")
+    parser.add_argument("--save_interval", type=int, default=100, help="模型保存间隔")
+    parser.add_argument('--hidden_size', default=512, type=int, help="隐藏层维度（512=Small-26M, 768=Base-104M）")
+    parser.add_argument('--num_hidden_layers', default=8, type=int, help="隐藏层数量（Small=8, Base=16）")
+    parser.add_argument('--retriever_hidden_size', default=512, type=int, help="隐藏层维度（512=Small-26M, 768=Base-104M）")
+    parser.add_argument('--retriever_num_hidden_layers', default=8, type=int, help="隐藏层数量（Small=8, Base=16）")
+    parser.add_argument('--max_new_tokens', default=8192, type=int, help="最大生成长度（注意：并非模型实际长文本能力）")
+    parser.add_argument('--temperature', default=0.85, type=float, help="生成温度，控制随机性（0-1，越大越随机）")
+    parser.add_argument('--top_p', default=0.85, type=float, help="nucleus采样阈值（0-1）")
+    parser.add_argument('--top_k', default=20, type=int, help="retriever检索阈值（top_k越大检索能力越强）")
+    parser.add_argument('--rag', default=1, type=int, choices=[0, 1], help="是否使用RAG")
+    parser.add_argument('--max_query_len', default=64, type=int, help="单个问题最大长度")
+    parser.add_argument('--max_passage_len', default=128, type=int, help="单个检索文档最大长度")
+    parser.add_argument('--historys', default=0, type=int, help="携带历史对话轮数（需为偶数，0表示不携带历史）")
+    parser.add_argument('--use_sbert_retriever', default=1, type=int, choices=[0, 1], help="是否使用Sentence-BERT作为retriever（能力比自己训练的强）")
+    parser.add_argument('--dataset_name', default="ChineseSquad", type=str, choices=["ChineseSquad", "natural-questions"])
+    parser.add_argument('--from_resume', default=0, type=int, choices=[0, 1], help="是否自动检测&续训（0=否，1=是）")
+    parser.add_argument('--from_weight', default='none', type=str, help="基于哪个权重训练，为none则从头开始")
+    parser.add_argument('--use_wandb', default=1, type=int, choices=[0, 1])
+    parser.add_argument('--use_swanlab', default=1, type=int, choices=[0, 1], help="用swanlab替代wandb（需要use_wandb也为True）")
+    parser.add_argument('--wandb_entity', default="", type=str)
+    parser.add_argument('--wandb_project', default="MiniMind-DPR", type=str)
+    parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu', type=str, help="运行设备")
+    args = parser.parse_args()
+    # fmt: on
+    train_args = TrainArgs(
+        save_dir=args.save_dir,
+        save_weight=args.weight,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        learning_rate=args.learning_rate,
+        device=args.device,
+        dtype=args.dtype,
+        accumulation_steps=args.accumulation_steps,
+        grad_clip=args.grad_clip,
+        log_interval=args.log_interval,
+        save_interval=args.save_interval,
+        hidden_size=args.retriever_hidden_size,
+        num_hidden_layers=args.retriever_num_hidden_layers,
+        max_query_len=args.max_query_len,
+        max_passage_len=args.max_passage_len,
+        temperature=args.temperature,
+        from_weight=args.from_weight,
+        from_resume=args.from_resume,
+        dataset=args.dataset_name,
+        use_wandb=args.use_wandb,
+        use_swanlab=args.use_swanlab,
+        wandb_entity=args.wandb_entity,
+        wandb_project=args.wandb_project,
+    )
+    eval_args = EvalArgs(
+        load_from=args.load_from,
+        weight=args.weight,
+        lora_weight=args.lora_weight,
+        hidden_size=args.hidden_size,
+        num_hidden_layers=args.num_hidden_layers,
+        use_moe=args.use_moe,
+        inference_rope_scaling=args.inference_rope,
+        max_new_tokens=args.max_new_tokens,
+        temperature=args.temperature,
+        top_p=args.top_p,
+        historys=args.historys,
+        device=args.device,
+    )
+    if args.mode == "eval":
+        dataset = load_dataset(args.dataset_name, max_passage_len=args.max_passage_len)
+        if args.use_sbert_retriever:
+            retriever = None
+            tokenizer = None
+        else:
+            init_model()
+            retriever = 1
+            tokenizer = AutoTokenizer.from_pretrained(project_dir / "model")
+        dataset = DPRDataset(
+            dataset, tokenizer, args.max_query_len, args.max_passage_len
+        )
+        documents = dataset.tolist()[1]
+        retriever, reranker, doc_embeddings = init_rag(
+            eval_args.device,
+            documents,
+            retriever=retriever,
+            tokenizer=tokenizer,
+            max_length=args.max_passage_len,
+        )
+        evaluate(eval_args, retriever, reranker, documents, doc_embeddings)
+    else:
+        pass
