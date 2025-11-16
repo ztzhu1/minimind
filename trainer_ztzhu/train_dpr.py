@@ -94,18 +94,15 @@ def load_jsonl(path):
 
 
 def load_dataset(
-    dataset="sentence-transformers/natural-questions",
+    dataset="lighteval/ChineseSquad",
     max_query_len=64,
-    max_passage_len=512,
-    split=True,
+    max_passage_len=128,
 ):
     dataset = datasets.load_dataset(dataset)
     dataset = dataset.filter(
-        lambda x: len(x["query"]) <= max_query_len
-        and len(x["answer"]) <= max_passage_len
+        lambda x: len(x["question"]) <= max_query_len
+        and len(x["context"]) <= max_passage_len
     )
-    if split:
-        dataset = dataset["train"].train_test_split(test_size=0.05, seed=42)
     return dataset
 
 
@@ -115,7 +112,7 @@ class DPRDataset(Dataset):
         dataset: datasets.Dataset,
         tokenizer: PreTrainedTokenizerBase,
         max_query_len=64,
-        max_passage_len: int = 512,
+        max_passage_len: int = 128,
     ):
         super().__init__()
         self.tokenizer = tokenizer
@@ -418,7 +415,7 @@ class TrainArgs:
     hidden_size: int = 512  # 隐藏层维度
     num_hidden_layers: int = 8  # 隐藏层数量
     max_query_len: int = 64
-    max_passage_len: int = 512
+    max_passage_len: int = 128
     use_amp: bool = None  # 使用自动混合精度
     temperature: float = 1.0
     from_weight: str = "pretrain"  # 基于哪个权重训练，为none则从头开始
@@ -795,8 +792,9 @@ def init_rag(device, documents: Union[List[str], datasets.Dataset] = None):
     )
     reranker.to(device)
     reranker.eval()
+    return retriver, reranker
     if documents is None:
-        documents = load_dataset("sentence-transformers/natural-questions", split=False)
+        documents = load_dataset()
         documents = documents["train"]["answer"]
     doc_embeddings = retriver.encode(
         documents, convert_to_tensor=True, show_progress_bar=True
@@ -860,7 +858,7 @@ def evaluate(
 ):
     from eval_llm import init_model
 
-    prompts = ["介绍音乐剧'Hamilton'", "YouTube上观看量最高的视频是什么"]
+    prompts = ['介绍音乐剧"Hamilton"', "YouTube上观看量最高的视频是什么"]
 
     conversation = []
     model, tokenizer = init_model(args)

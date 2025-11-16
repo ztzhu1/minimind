@@ -5,24 +5,28 @@ project_dir = Path(__file__).parent.parent
 project_path = project_dir.as_posix()
 if project_path not in sys.path:
     sys.path.insert(0, project_path)
-
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
+from copy import deepcopy
 from dataclasses import asdict, dataclass
+import json
 import os
 import time
 from typing import Union
 import warnings
 
+import datasets
+from openai import OpenAI
+import pandas as pd
 import torch
 from torch import nn, optim
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import DataLoader, Dataset, DistributedSampler
 from tqdm import tqdm
 import wandb
 
-from dataset.lm_dataset import SFTDataset
 from model.model_minimind import MiniMindConfig
 from trainer_ztzhu.trainer_utils import (
     Logger,
@@ -39,20 +43,148 @@ from trainer_ztzhu.trainer_utils import (
 
 warnings.filterwarnings("ignore")
 
+api_keys = None
+
+
+def save_jsonl(lines: Union[list[dict], pd.DataFrame], path, overwrite=False):
+    if isinstance(lines, pd.DataFrame):
+        lines = lines.to_dict(orient="records")
+
+    path = Path(path)
+    if not overwrite:
+        assert not path.exists()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        for i, line in enumerate(lines):
+            json_line = json.dumps(line, ensure_ascii=False, separators=(",", ":"))
+            if i == 0:
+                f.write(json_line)
+            else:
+                f.write("\n" + json_line)
+    print(f"Saved {len(lines)} lines to {path.as_posix()}")
+
+
+def load_jsonl(path):
+    data = pd.read_json(path_or_buf=path, lines=True)
+    return data
+
+
+def make_sft_dataset(dataset, batch_size=1, indexes=None, counterexample=False):
+    global api_keys
+    if api_keys is None:
+        with open(project_dir / "api_keys.json", "r") as f:
+            api_keys = json.load(f)
+
+    path = project_dir.joinpath("dataset", "ChineseSquad_train.jsonl")
+    sft_data = load_jsonl(path)
+
+    with open(project_dir / "dataset" / "annot_ChineseSquad.prompt", "r") as f:
+        pre_prompt = f.read()
+
+    if len(sft_data) == 0:
+        sft_data = pd.DataFrame(columns=["question", "context", "answers", "answer"])
+        start = 0
+    else:
+        start = len(sft_data)
+    if counterexample:
+        offset = 200
+    else:
+        offset = 0
+
+    # client = OpenAI(api_key=api_keys["deepseek"], base_url="https://api.deepseek.com")
+    client = OpenAI(
+        api_key=api_keys["chatanywhere"], base_url="https://api.chatanywhere.tech"
+    )
+
+    def get_response(index):
+        if counterexample:
+            sample = deepcopy(dataset[index])
+            sample["question"] = dataset[index + offset]["question"]
+            content = pre_prompt + str(sample)
+        else:
+            content = pre_prompt + str(dataset[index])
+        response = client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a dataset annotation expert.",
+                },
+                {
+                    "role": "user",
+                    "content": content,
+                },
+            ],
+            stream=False,
+        )
+        response = response.choices[0].message.content
+        return index, response
+
+    pool = ThreadPoolExecutor()
+    results = []
+    if indexes is None:
+        indexes = range(start, start + batch_size)
+    for index in indexes:
+        results.append(pool.submit(get_response, index))
+
+    for result in results:
+        index, response = result.result()
+        sft_data.loc[index] = {
+            "question": dataset[index + offset]["question"],
+            "context": dataset[index]["context"],
+            "answers": dataset[index]["answers"],
+            "answer": response,
+        }
+    save_jsonl(sft_data, path, overwrite=True)
+
+
+class SFTDataset(Dataset):
+    def __init__(self, jsonl_path, tokenizer, max_length=512):
+        super().__init__()
+        self.tokenizer = tokenizer
+        self.jsonl_path = jsonl_path
+        self.samples = load_jsonl(jsonl_path)
+        self.max_length = max_length
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, index):
+        sample = self.samples.iloc[index]
+        prompt = f'你是一个智能问答助手，请严格按照以下要求回答问题： 如果资料中包含问题答案，请直接使用资料信息并注明"根据资料"，如果资料不相关、信息不足或未包含答案，请明确说明"资料中未包含相关信息"，然后可以基于常识进行补充\n资料：{sample["context"]}\n问题：{sample["question"]}\n现在请开始回答：'
+        prompt = f"<|im_start|>system\nYou are a helpful assistant<|im_end|>\n<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+        response = f"{sample['answer']}<|im_end|>"
+        result = self.tokenizer(
+            [(prompt, response)],
+            padding="max_length",
+            padding_side="right",
+            return_token_type_ids=True,
+            return_tensors="pt",
+            max_length=self.max_length,
+            truncation=True,
+        )
+        input_ids = result.input_ids.view(-1)
+        loss_mask = result.token_type_ids.view(-1)
+
+        X = torch.tensor(input_ids[:-1], dtype=torch.long)
+        Y = torch.tensor(input_ids[1:], dtype=torch.long)
+        loss_mask = torch.tensor(loss_mask[1:], dtype=torch.long)
+        return X, Y, loss_mask
+
 
 @dataclass
 class TrainArgs:
     save_dir: Union[str, Path] = project_dir / "checkpoints"  # 模型保存目录
     save_weight: str = "sft"  # 保存权重的前缀名
     epochs: int = 1
-    batch_size: int = 16
-    learning_rate: float = 1e-5
+    batch_size: int = 8
+    learning_rate: float = 2e-6
     weight_decay: float = 0.0
     betas: tuple = (0.9, 0.999)
     device: str = None
     dtype: str = "bfloat16"
     num_workers: int = 0  # 数据加载线程数
-    accumulation_steps: int = 8  # 梯度累积步数
+    accumulation_steps: int = 2  # 梯度累积步数
     grad_clip: float = 1.0  # 梯度裁剪阈值
     log_interval: int = 100  # 日志打印间隔
     save_interval: int = 100  # 模型保存间隔
@@ -318,7 +450,7 @@ def train(
                 "save_dir",
                 "model_dir",
             ]:
-                config.pop(key)
+                config.pop(key, None)
             config["max_step"] = max_step
             config["num_params"] = num_params
         wandb_kwargs = dict(

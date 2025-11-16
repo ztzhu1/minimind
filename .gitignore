@@ -8,3 +8,5 @@ swanlog
 wandb
 *.pth
 benchmark
+*.prompt
+api_keys.json
