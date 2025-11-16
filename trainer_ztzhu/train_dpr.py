@@ -41,16 +41,19 @@ from torch.utils.data import DataLoader, Dataset, DistributedSampler
 from tqdm import tqdm, trange
 from transformers import (
     AutoModel,
+    AutoModelForSequenceClassification,
     AutoTokenizer,
     BatchEncoding,
     BertModel,
     BertTokenizerFast,
     PreTrainedModel,
     PreTrainedTokenizerBase,
+    TextStreamer,
 )
 import wandb
 
 from model.model_minimind import MiniMindConfig
+from sentence_transformers import SentenceTransformer
 from trainer.trainer_utils import (
     Logger,
     MiniMindForCausalLM,
@@ -65,6 +68,8 @@ warnings.filterwarnings("ignore")
 
 
 # ----- dataset utils -----
+
+
 def save_jsonl(lines: Union[list[dict], pd.DataFrame], path, overwrite=False):
     if isinstance(lines, pd.DataFrame):
         lines = lines.to_dict(orient="records")
@@ -92,13 +97,15 @@ def load_dataset(
     dataset="sentence-transformers/natural-questions",
     max_query_len=64,
     max_passage_len=512,
+    split=True,
 ):
     dataset = datasets.load_dataset(dataset)
     dataset = dataset.filter(
         lambda x: len(x["query"]) <= max_query_len
         and len(x["answer"]) <= max_passage_len
     )
-    dataset = dataset["train"].train_test_split(test_size=0.05, seed=42)
+    if split:
+        dataset = dataset["train"].train_test_split(test_size=0.05, seed=42)
     return dataset
 
 
@@ -145,7 +152,9 @@ class DPRDataset(Dataset):
         return query_inputs, passage_inputs
 
 
-# ----- model -----
+# ----- retriever model -----
+
+
 class Encoder(nn.Module):
     """
     Adapted from CMU-11-667 (https://cmu-llms.org/) EncoderModel
@@ -215,10 +224,9 @@ class Encoder(nn.Module):
 
 
 @torch.inference_mode()
-def similarity_bert(model_bert, queries: List[str], passages: List[str]):
-    from sentence_transformers import SentenceTransformer
-
-    model_bert: SentenceTransformer = model_bert  # for type hint
+def similarity_bert(
+    model_bert: SentenceTransformer, queries: List[str], passages: List[str]
+):
     if isinstance(queries, str):
         queries = [queries]
     if isinstance(passages, str):
@@ -249,7 +257,6 @@ def benchmark_retriever(
     dataset: DPRDataset,
     top_k=[20, 40, 60, 80, 100],
     batch_size=256,
-    save_path: str = None,
 ):
     if not np.iterable(top_k):
         top_k = [top_k]
@@ -298,13 +305,6 @@ def benchmark_retriever(
         accuracy[_top_k] = acc
     torch.cuda.empty_cache()
     return accuracy
-    breakpoint()
-    queries = list(dataset["query"])
-    passages = list(dataset["answer"])
-
-    if save_path is not None:
-        save_path = Path(save_path)
-        save_path.parent.mkdir(parents=True, exist_ok=True)
 
 
 class BM25:
@@ -396,7 +396,9 @@ class BM25:
         return np.log((self.num_chunks - n + 0.5) / (n + 0.5) + 1)
 
 
-# ----- train -----
+# ----- train retriever -----
+
+
 @dataclass
 class TrainArgs:
     save_dir: Union[str, Path] = project_dir / "checkpoints"  # 模型保存目录
@@ -497,10 +499,10 @@ def train_epoch(
     spend_time=0,
 ):
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
-    start_time = time.time()
     grad_norm = float("nan")
     adv = float("nan")
     wandb = args.wandb
+    start_time = time.time()
 
     def get_spend_time():
         return spend_time + time.time() - start_time
@@ -778,3 +780,135 @@ def train(
             if args.profile:
                 return
     bar.close()
+
+
+# ----- RAG -----
+
+
+def init_rag(device, documents: Union[List[str], datasets.Dataset] = None):
+    print("loading models and encoding documents, this may take a while...")
+    retriver = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
+    retriver.to(device)
+    retriver.eval()
+    reranker = AutoModelForSequenceClassification.from_pretrained(
+        "jinaai/jina-reranker-v2-base-multilingual", trust_remote_code=True
+    )
+    reranker.to(device)
+    reranker.eval()
+    if documents is None:
+        documents = load_dataset("sentence-transformers/natural-questions", split=False)
+        documents = documents["train"]["answer"]
+    doc_embeddings = retriver.encode(
+        documents, convert_to_tensor=True, show_progress_bar=True
+    )
+    return retriver, reranker, doc_embeddings
+
+
+@torch.inference_mode()
+def retrive(
+    query: str,
+    retriver: SentenceTransformer,
+    reranker: PreTrainedModel,
+    documents: List[str],
+    doc_embeddings: torch.Tensor,
+    top_k=20,
+):
+    """
+    corpus_embeddings: (n_passages, hidden_dim)
+    """
+    query_embeddings = retriver.encode(query, convert_to_tensor=True)  # (hidden_dim,)
+    similarity = doc_embeddings @ query_embeddings
+    values, indices = torch.topk(similarity, k=top_k)
+    indices = indices.cpu().numpy()
+    sentence_pairs = [[query, documents[i]] for i in indices]
+    scores = reranker.compute_score(sentence_pairs)
+    max_index = indices[np.argsort(scores)[-1]]
+    return max_index.item(), documents[max_index]
+
+
+@dataclass
+class EvalArgs:
+    load_from: str = "model"
+    save_dir: str = "out"
+    weight: str = "full_sft"
+    lora_weight: str = "None"
+    hidden_size: int = 768
+    num_hidden_layers: int = 16
+    use_moe: int = 0
+    inference_rope_scaling: bool = False
+    max_new_tokens: int = 8192
+    temperature: float = 0.85
+    top_p: float = 0.85
+    top_k: int = 20
+    rag: bool = True
+    historys: int = 0
+    device: str = None
+
+    def __post_init__(self):
+        if self.device is None:
+            self.device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        self.save_dir = Path(self.save_dir).as_posix()
+
+
+@torch.inference_mode()
+def evaluate(
+    args,
+    retriver: SentenceTransformer,
+    reranker: PreTrainedModel,
+    documents: List[str],
+    doc_embeddings: torch.Tensor,
+):
+    from eval_llm import init_model
+
+    prompts = ["介绍音乐剧'Hamilton'", "YouTube上观看量最高的视频是什么"]
+
+    conversation = []
+    model, tokenizer = init_model(args)
+    input_mode = int(input("[0] 自动测试\n[1] 手动输入\n"))
+    streamer = TextStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
+
+    prompt_iter = prompts if input_mode == 0 else iter(lambda: input("👶: "), "")
+    for prompt in prompt_iter:
+        setup_seed(2026)  # or setup_seed(random.randint(0, 2048))
+        if input_mode == 0:
+            print(f"👶: {prompt}")
+        if args.rag:
+            doc = retrive(
+                prompt, retriver, reranker, documents, doc_embeddings, top_k=args.top_k
+            )[1]
+            prompt = f'你是一个智能问答助手，请严格按照以下要求回答问题： 如果资料中包含问题答案，请直接使用资料信息并注明"根据资料"，如果资料不相关、信息不足或未包含答案，请明确说明"资料中未包含相关信息"，然后可以基于常识进行补充\n资料：{doc}\n问题：{prompt}\n现在请开始回答：'
+        conversation = conversation[-args.historys :] if args.historys else []
+        conversation.append({"role": "user", "content": prompt})
+
+        templates = {
+            "conversation": conversation,
+            "tokenize": False,
+            "add_generation_prompt": True,
+        }
+        if args.weight == "reason":
+            templates["enable_thinking"] = True  # 仅Reason模型使用
+        inputs = (
+            tokenizer.apply_chat_template(**templates)
+            if args.weight != "pretrain"
+            else (tokenizer.bos_token + prompt)
+        )
+        inputs = tokenizer(inputs, return_tensors="pt", truncation=True).to(args.device)
+
+        print("🤖️:", end="")
+        generated_ids = model.generate(
+            inputs=inputs["input_ids"],
+            attention_mask=inputs["attention_mask"],
+            max_new_tokens=args.max_new_tokens,
+            do_sample=True,
+            streamer=streamer,
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+            top_p=args.top_p,
+            temperature=args.temperature,
+            repetition_penalty=1.0,
+        )
+        response = tokenizer.decode(
+            generated_ids[0][len(inputs["input_ids"][0]) :], skip_special_tokens=True
+        )
+        conversation.append({"role": "assistant", "content": response})
+        print("")
