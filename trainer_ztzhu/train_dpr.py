@@ -42,6 +42,7 @@ from torch.utils.data import DataLoader, Dataset, DistributedSampler
 from tqdm import tqdm, trange
 from transformers import (
     AutoModel,
+    AutoModelForCausalLM,
     AutoModelForSequenceClassification,
     AutoTokenizer,
     BatchEncoding,
@@ -53,6 +54,7 @@ from transformers import (
 )
 import wandb
 
+from model.model_lora import apply_lora, load_lora
 from model.model_minimind import MiniMindConfig
 from sentence_transformers import SentenceTransformer
 from trainer.trainer_utils import (
@@ -475,16 +477,16 @@ class TrainArgs:
     save_interval: int = 100  # 模型保存间隔
     hidden_size: int = 512  # 隐藏层维度
     num_hidden_layers: int = 8  # 隐藏层数量
-    max_query_len: int = 64
-    max_passage_len: int = 128
+    max_query_len: int = 64  # 问题最大长度
+    max_passage_len: int = 128  # 单个document的最大长度，对于`natural-questions`数据集，建议设置为512
     use_amp: bool = None  # 使用自动混合精度
     temperature: float = 1.0
     from_weight: str = "pretrain"  # 基于哪个权重训练，为none则从头开始
     from_resume: int = 0  # 是否自动检测&续训（0=否，1=是）
-    dataset: str = "ChineseSquad"
+    dataset: str = "ChineseSquad"  # 训练数据集（同时也是检索数据集），`ChineseSquad`或`natural-questions`
     use_wandb: bool = False
-    use_swanlab: bool = False
-    train_bert: bool = False
+    use_swanlab: bool = False  # 使用swanlab时需要同时设置use_wandb=True, wandb会被替换为swanlab
+    train_bert: bool = False  # 是否训练BERT-Mini，若是则加载BERT，则MiniMind模型和权重均失效
     wandb_entity: str = None
     wandb_project: str = "MiniMind"
 
@@ -514,28 +516,56 @@ def get_num_params(model):
 
 
 def init_model(
-    lm_config,
+    lm_config=None,
     from_weight="pretrain",
     tokenizer_path="../model",
     save_dir="../out",
     device="cuda",
     bert=False,
+    eval_args=None,
 ):
-    if bert:
-        model = AutoModel.from_pretrained("prajjwal1/bert-mini")
-        tokenizer = AutoTokenizer.from_pretrained("prajjwal1/bert-mini")
+    if eval_args is not None:
+        tokenizer = AutoTokenizer.from_pretrained(eval_args.load_from)
+        if "model" in eval_args.load_from:
+            model = MiniMindForCausalLM(
+                MiniMindConfig(
+                    hidden_size=eval_args.hidden_size,
+                    num_hidden_layers=eval_args.num_hidden_layers,
+                    use_moe=bool(eval_args.use_moe),
+                    inference_rope_scaling=eval_args.inference_rope_scaling,
+                )
+            )
+            moe_suffix = "_moe" if eval_args.use_moe else ""
+            ckp = f"{eval_args.save_dir}/{eval_args.weight}_{eval_args.hidden_size}{moe_suffix}.pth"
+            model.load_state_dict(
+                torch.load(ckp, map_location=eval_args.device), strict=True
+            )
+            if eval_args.lora_weight != "None":
+                apply_lora(model)
+                load_lora(
+                    model,
+                    f"{eval_args.save_dir}/lora/{eval_args.lora_weight}_{eval_args.hidden_size}.pth",
+                )
+        else:
+            model = AutoModelForCausalLM.from_pretrained(
+                eval_args.load_from, trust_remote_code=True
+            )
     else:
-        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-        model = MiniMindForCausalLM(lm_config)
-    model = Encoder(model, temperature=1.0)
+        if bert:
+            model = AutoModel.from_pretrained("prajjwal1/bert-mini")
+            tokenizer = AutoTokenizer.from_pretrained("prajjwal1/bert-mini")
+        else:
+            tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+            model = MiniMindForCausalLM(lm_config)
+        model = Encoder(model, temperature=1.0)
 
-    if from_weight != "none":
-        moe_suffix = "_moe" if lm_config.use_moe else ""
-        weight_path = (
-            f"{save_dir}/{from_weight}_{lm_config.hidden_size}{moe_suffix}.pth"
-        )
-        weights = torch.load(weight_path, map_location=device)
-        model.load_state_dict(weights, strict=False)
+        if from_weight != "none":
+            moe_suffix = "_moe" if lm_config.use_moe else ""
+            weight_path = (
+                f"{save_dir}/{from_weight}_{lm_config.hidden_size}{moe_suffix}.pth"
+            )
+            weights = torch.load(weight_path, map_location=device)
+            model.load_state_dict(weights, strict=False)
 
     Logger(
         f"所加载Model可训练参数：{sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.3f} 百万"
@@ -795,7 +825,9 @@ def train(
         if args.use_swanlab:
             wandb_kwargs.pop("entity")
         run = wandb.init(**wandb_kwargs)
-        if not args.use_swanlab:
+        if args.use_swanlab:
+            run = nullcontext()
+        else:
             wandb.define_metric("train_step")
             wandb.define_metric("eval_step")
             wandb.define_metric("train/*", step_metric="train_step")
@@ -838,30 +870,36 @@ def train(
 
 @dataclass
 class EvalArgs:
-    load_from: str = "model"
+    load_from: str = project_dir / "model"
+    save_dir: str = "out"
     weight: str = "full_sft"
-    hidden_size: int = 768
-    num_hidden_layers: int = 16
+    lora_weight: str = "None"
+    hidden_size: int = 768  # chat模型隐藏层维度(与retriever无关)
+    num_hidden_layers: int = 16  # chat模型隐藏层数量(与retriever无关)
     use_moe: int = 0
     inference_rope_scaling: bool = False
     max_new_tokens: int = 8192
     temperature: float = 0.85
     top_p: float = 0.85
-    top_k: int = 20
-    rag: bool = True
+    top_k: int = 20  # 检索时返回的文档数量，reranker会从中选择最终答案
+    rag: bool = True  # 是否开启RAG
     max_query_len: int = 64
     max_passage_len: int = 128
     historys: int = 0
-    use_sbert_retriever: bool = True
+    use_sbert_retriever: bool = True  # 使用sentence-transformer作为retriever，检索成功率会大幅提升
     device: str = None
 
     def __post_init__(self):
         if self.device is None:
             self.device = "cuda:0" if torch.cuda.is_available() else "cpu"
-        self.model_dir = project_dir / "out"
-        if not self.model_dir.exists():
-            self.model_dir = project_dir / "checkpoints"
-        self.model_dir = self.model_dir.as_posix()
+        self.save_dir = Path(self.save_dir)
+        if not self.save_dir.is_absolute():
+            self.save_dir = project_dir / self.save_dir
+        if not self.save_dir.exists():
+            self.save_dir = project_dir / "checkpoints"
+        self.save_dir = self.save_dir.as_posix()
+        if isinstance(self.load_from, Path):
+            self.load_from = self.load_from.as_posix()
 
 
 @torch.inference_mode()
@@ -870,12 +908,12 @@ def init_rag(
     documents: Union[List[str], datasets.Dataset] = None,
     retriever: Encoder = None,
     tokenizer: PreTrainedTokenizerBase = None,
-    max_length=128,
+    eval_args: EvalArgs = None,
 ):
     print("loading models and encoding documents, this may take a while...")
-    if retriever is None:
+    if retriever is None or eval_args.use_sbert_retriever:
         retriever = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
-        encode_fn = lambda retriever: retriever.encode_text(
+        encode_fn = lambda retriever: retriever.encode(
             documents, convert_to_tensor=True, show_progress_bar=True
         )
     else:
@@ -887,7 +925,7 @@ def init_rag(
             for i in trange(step):
                 docs = documents[i * batch_size : (i + 1) * batch_size]
                 p_embeddings = retriever.encode_text(
-                    docs, tokenizer, max_length=max_length
+                    docs, tokenizer, max_length=eval_args.max_passage_len
                 )
                 all_p_embeddings.append(p_embeddings)
             p_embeddings = torch.cat(
@@ -925,7 +963,7 @@ def retrieve(
     corpus_embeddings: (n_passages, hidden_dim)
     """
     if isinstance(retriever, SentenceTransformer):
-        query_embeddings = retriever.encode_text(
+        query_embeddings = retriever.encode(
             query, convert_to_tensor=True
         )  # (hidden_dim,)
     else:
@@ -949,13 +987,15 @@ def evaluate(
     documents: List[str],
     doc_embeddings: torch.Tensor,
 ):
-    from eval_llm import init_model
-
-    prompts = ['介绍音乐剧"Hamilton"', "YouTube上观看量最高的视频是什么"]
+    prompts = [
+        "估计有4.88亿至5.35亿人信奉什么宗教",
+        "南安普敦机场在哪个城镇",
+        "路德什么时候死的",
+        "超级碗开幕之夜于何时在何地举行",
+    ]
 
     conversation = []
-    if model is None:
-        model, tokenizer = init_model(args)
+    model, tokenizer = init_model(eval_args=args)
     input_mode = int(input("[0] 自动测试\n[1] 手动输入\n"))
     streamer = TextStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
 
